@@ -122,8 +122,14 @@ const PRIVILEGED_METHODS = new Set([
  * Mounts the API gateway under the browser transport prefix. Every request on
  * the prefix passes the browser-trust fence first (DNS-rebinding and
  * cross-site defense — [api-request-trust](./api-request-trust.ts));
- * privileged methods additionally pass it with an empty trust list, which
- * pins them to loopback.
+ * privileged methods additionally pass it with the deployment's declared
+ * trust list, so loopback plus every `--trusted-host` authority (the fence's
+ * own semantics: a DNS-rebinding fence, explicitly not authentication) can
+ * reach the configuration plane. Deployment-local patch: upstream pins the
+ * configuration plane to loopback until a real authentication layer exists;
+ * this deployment serves the UI only on a private tailnet whose ACLs gate
+ * who can resolve the declared host, so the declared authority is trusted
+ * like loopback.
  * @param ctx - Host plugin context.
  * @param config - resolved plugin config (schema defaults applied).
  */
@@ -144,7 +150,7 @@ export function apply(ctx: Context, config?: ConnectionConfig): void {
         : undefined
       if (method !== undefined
         && PRIVILEGED_METHODS.has(method)
-        && !isTrustedApiRequest(request, [])) {
+        && !isTrustedApiRequest(request, trustedHosts)) {
         return new Response('forbidden', { status: 403 })
       }
       if (request.method === 'GET' && (pathname === MUX_EVENTS_PATH || pathname === HOST_EVENTS_PATH)) {

@@ -1,0 +1,19 @@
+# Deployment overlay: pin the browse directory picker.
+#
+# The adaptive row (dsh-host-directory-picker-auto) resolves `native` on this
+# host (loopback bind + display), but the native backend's host.pickDirectory
+# is pinned to loopback by the /api browser-trust fence — remote tailnet
+# browsers would 403. The browse interaction (in-page folder browser over
+# host.listDirectory/createDirectory, which the fence serves to trusted
+# origins) works from any browser. Disables the adaptive row and mounts the
+# browse pair directly; both package names are already declared dependencies
+# of the web app.
+- id: directory-picker
+  disabled: true
+
+- insert:
+    - id: directory-picker-browse
+      name: '@deepseek-ai/dsh-host-directory-picker-browse'
+
+    - id: directory-picker-surface
+      name: '@deepseek-ai/dsh-client-ui-directory-picker-browse'
