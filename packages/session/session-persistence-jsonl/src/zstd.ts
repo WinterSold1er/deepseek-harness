@@ -113,6 +113,21 @@ export async function compressZstdFrame(input: Buffer | string): Promise<Buffer>
 }
 
 /**
+ * Split the first frame's plaintext at the terminator of its leading header
+ * record. The header record is the log's first record; a writer may put event
+ * records in the same frame, so the caller feeds the remainder to its scanner.
+ * @param plaintext - decoded plaintext of the first Zstandard frame.
+ * @returns the header record including its newline, and the bytes after it.
+ */
+export function splitHeaderRecord(plaintext: Buffer): { readonly header: Buffer; readonly rest: Buffer } {
+  const end = plaintext.indexOf(0x0A)
+  if (end === -1) {
+    throw new Error('corrupt Zstandard session log: first frame has no header record terminator')
+  }
+  return { header: plaintext.subarray(0, end + 1), rest: plaintext.subarray(end + 1) }
+}
+
+/**
  * Decompress one complete frame and validate its checksum.
  * @param input - one structurally complete Zstandard frame.
  * @returns the frame plaintext.

@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { SessionSeq, SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent, SessionHeader } from '@deepseek-ai/dsh-session'
+import { SessionPersistenceCorruptionError } from '@deepseek-ai/dsh-session-persistence'
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import {
@@ -82,6 +83,22 @@ async function appendBatch(persistence: SessionPersistence, id: SessionId, event
   } finally {
     await handle.close()
   }
+}
+
+/**
+ * Write one whole log into a single Zstandard frame: the header record followed
+ * by `body`, which holds the encoded event records (or arbitrary bytes).
+ */
+async function writeSingleFrameLog(root: string, header: SessionHeader, body: string): Promise<string> {
+  const path = logPath(root, header.cwd, header.id, 'zstd')
+  await mkdir(sessionDir(root, header.cwd, header.id), { recursive: true })
+  await writeFile(path, await compressZstdFrame(`${JSON.stringify(toHeaderLine(header))}\n${body}`))
+  return path
+}
+
+/** Encode one event batch as newline-terminated JSONL rows. */
+function eventRows(events: readonly SessionEvent[]): string {
+  return events.map(event => `${JSON.stringify(event)}\n`).join('')
 }
 
 async function decodeCompleteFrames(buffer: Buffer): Promise<Buffer> {
@@ -797,16 +814,16 @@ describe('JsonlSessionPersistence: default Zstandard encoding', () => {
     const ctx = await mount(root)
     expect(await ctx.sessionPersistence.list()).toEqual([])
 
-    const twoLinesId = SessionId('two-lines')
-    await mkdir(sessionDir(root, undefined, twoLinesId), { recursive: true })
-    await writeFile(logPath(root, undefined, twoLinesId, 'zstd'), await compressZstdFrame([
-      JSON.stringify(toHeaderLine(meta('two-lines'))),
+    const singleFrameId = SessionId('single-frame-bad-record')
+    await mkdir(sessionDir(root, undefined, singleFrameId), { recursive: true })
+    await writeFile(logPath(root, undefined, singleFrameId, 'zstd'), await compressZstdFrame([
+      JSON.stringify(toHeaderLine(meta('single-frame-bad-record'))),
       JSON.stringify({ type: 'turn/start' }),
       '',
     ].join('\n')))
-    expect(await ctx.sessionPersistence.list()).toEqual([])
-    await expect(ctx.sessionPersistence.open(twoLinesId, 'read'))
-      .rejects.toThrow(/first frame is not exactly one header line/)
+    expect((await ctx.sessionPersistence.list()).map(item => item.header.id)).toEqual([singleFrameId])
+    await expect(ctx.sessionPersistence.open(singleFrameId, 'read'))
+      .rejects.toBeInstanceOf(SessionPersistenceCorruptionError)
   })
 
   it('rejects missing, empty, and checksum-corrupt header frames on targeted reads', async () => {
@@ -824,12 +841,158 @@ describe('JsonlSessionPersistence: default Zstandard encoding', () => {
     await expect(ctx.sessionPersistence.open(SessionId('partial-only'), 'read'))
       .rejects.toThrow(/empty or header-less Zstandard session log/)
     await expect(ctx.sessionPersistence.open(SessionId('empty-header'), 'read'))
-      .rejects.toThrow(/first frame is not exactly one header line/)
+      .rejects.toThrow(/first frame has no header record terminator/)
     expect(await ctx.sessionPersistence.list()).toEqual([])
     await expect(ctx.sessionPersistence.stat(SessionId('bad-checksum')))
       .rejects.toThrow(/header frame failed validation/)
     await expect(ctx.sessionPersistence.open(SessionId('bad-checksum'), 'read'))
       .rejects.toThrow(/frame at byte 0 failed validation/)
+  })
+})
+
+describe('JsonlSessionPersistence: single-frame Zstandard logs', () => {
+  it('reads a session whose header record and events share one Zstandard frame', async () => {
+    const root = await freshRoot()
+    const ctx = await mount(root)
+    const header = meta('single-frame', '/proj')
+    await writeSingleFrameLog(root, header, eventRows(oneTurnLog()))
+
+    const listed = await ctx.sessionPersistence.list()
+    expect(listed.map(item => item.header.id)).toEqual([header.id])
+    const snapshot = await ctx.sessionPersistence.stat(header.id)
+    expect(snapshot?.location).toEqual({
+      kind: 'jsonl',
+      path: logPath(root, header.cwd, header.id, 'zstd'),
+    })
+    expect(snapshot?.header.id).toBe(header.id)
+    const stored = await readAll(ctx.sessionPersistence, header.id)
+    expect(stored.meta).toEqual({ ...header, delegationDepth: 0 })
+    expect(stored.events).toEqual(oneTurnLog())
+  })
+
+  it('keeps multi-frame logs readable', async () => {
+    const root = await freshRoot()
+    const ctx = await mount(root)
+    const header = meta('multi-frame', '/proj')
+    await writeLog(ctx.sessionPersistence, header, oneTurnLog())
+    const { frames, tornStart } = scanZstdFrames(await readFile(logPath(root, header.cwd, header.id, 'zstd')))
+    expect(tornStart).toBeUndefined()
+    expect(frames.length).toBeGreaterThan(1)
+
+    expect((await ctx.sessionPersistence.list()).map(item => item.header.id)).toEqual([header.id])
+    expect((await readAll(ctx.sessionPersistence, header.id)).events).toEqual(oneTurnLog())
+  })
+
+  it('skips empty and magic-only header frames with a warning', async () => {
+    const root = await freshRoot()
+    const fixtures = [
+      ['empty-log', Buffer.alloc(0)],
+      ['half-magic', MAGIC.subarray(0, 2)],
+    ] as const
+    for (const [id, bytes] of fixtures) {
+      await mkdir(sessionDir(root, undefined, SessionId(id)), { recursive: true })
+      await writeFile(logPath(root, undefined, SessionId(id), 'zstd'), bytes)
+    }
+    const ctx = await mount(root)
+    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => undefined)
+
+    expect(await ctx.sessionPersistence.list()).toEqual([])
+    expect(warn).toHaveBeenCalledTimes(fixtures.length)
+    for (const [id] of fixtures) {
+      const path = logPath(root, undefined, SessionId(id), 'zstd')
+      expect(warn.mock.calls.filter(([message]) => String(message).includes(path))).toHaveLength(1)
+    }
+    for (const [id] of fixtures) {
+      await expect(ctx.sessionPersistence.open(SessionId(id), 'read'))
+        .rejects.toThrow(/empty or header-less/)
+    }
+  })
+
+  it('discards a truncated first frame with a warning and rejects targeted reads', async () => {
+    const root = await freshRoot()
+    const ctx = await mount(root)
+    const header = meta('truncated-first-frame', '/proj')
+    const path = await writeSingleFrameLog(root, header, eventRows(oneTurnLog()))
+    await writeFile(path, (await readFile(path)).subarray(0, 12))
+    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => undefined)
+
+    expect(await ctx.sessionPersistence.list()).toEqual([])
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(path))
+    await expect(ctx.sessionPersistence.open(header.id, 'read'))
+      .rejects.toBeInstanceOf(SessionPersistenceCorruptionError)
+    await expect(ctx.sessionPersistence.stat(header.id))
+      .rejects.toBeInstanceOf(SessionPersistenceCorruptionError)
+  })
+
+  it('reads the header of a large single-frame log within a bounded number of reads', async () => {
+    const root = await freshRoot()
+    const ctx = await mount(root)
+    const header = meta('large-single-frame', '/proj')
+    const path = await writeSingleFrameLog(root, header, `${deterministicNoise(2_000_000)}\n`)
+    expect((await stat(path)).size).toBeGreaterThan(1024 * 1024)
+
+    const probe = await open(path, 'r')
+    const prototype = Object.getPrototypeOf(probe) as { read: HeaderRead }
+    await probe.close()
+    const read = vi.spyOn(prototype, 'read')
+
+    expect((await ctx.sessionPersistence.list()).map(item => item.header.id)).toEqual([header.id])
+    expect(read.mock.calls.length).toBeGreaterThan(0)
+    expect(read.mock.calls.length).toBeLessThan(8)
+  })
+
+  it('rejects a single-frame log whose only frame fails its checksum', async () => {
+    const root = await freshRoot()
+    const ctx = await mount(root)
+    const header = meta('single-frame-bad-checksum', '/proj')
+    const path = await writeSingleFrameLog(root, header, eventRows(oneTurnLog()))
+    const frame = Buffer.from(await readFile(path))
+    frame[frame.length - 1] = frame[frame.length - 1]! ^ 0xFF
+    await writeFile(path, frame)
+    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => undefined)
+
+    expect(await ctx.sessionPersistence.list()).toEqual([])
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(path))
+    await expect(ctx.sessionPersistence.stat(header.id)).rejects.toThrow(/header frame failed validation/)
+    await expect(ctx.sessionPersistence.open(header.id, 'read'))
+      .rejects.toBeInstanceOf(SessionPersistenceCorruptionError)
+  })
+
+  it('bounds the header scan instead of accumulating an oversized first record', async () => {
+    const root = await freshRoot()
+    const ctx = await mount(root)
+    const readable = meta('long-first-record', '/proj')
+    await writeSingleFrameLog(root, readable, eventRows(oneTurnLog()))
+
+    const padded = meta('padded-first-record')
+    const paddedPath = logPath(root, padded.cwd, padded.id, 'zstd')
+    await mkdir(sessionDir(root, padded.cwd, padded.id), { recursive: true })
+    await writeFile(paddedPath, await compressZstdFrame(
+      `${JSON.stringify({ ...toHeaderLine(padded), padding: 'x'.repeat(140_000) })}\n`,
+    ))
+
+    const oversized = meta('oversized-first-record')
+    const oversizedPath = logPath(root, oversized.cwd, oversized.id, 'zstd')
+    await mkdir(sessionDir(root, oversized.cwd, oversized.id), { recursive: true })
+    await writeFile(oversizedPath, await compressZstdFrame('a'.repeat(2 * 1024 * 1024)))
+
+    const torn = meta('empty-block-first-frame')
+    const tornPath = logPath(root, torn.cwd, torn.id, 'zstd')
+    await mkdir(sessionDir(root, torn.cwd, torn.id), { recursive: true })
+    // A frame of empty raw blocks never produces plaintext: only the
+    // compressed-byte bound stops a reader from consuming the whole file.
+    const emptyBlocks = Buffer.concat([
+      MAGIC,
+      Buffer.from([0x00, 0x00]),
+      Buffer.alloc(1_100_000, 0x00),
+    ])
+    expect(scanZstdFrames(emptyBlocks).tornStart).toBe(0)
+    await writeFile(tornPath, emptyBlocks)
+
+    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => undefined)
+    expect((await ctx.sessionPersistence.list()).map(item => item.header.id)).toContain(readable.id)
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(oversizedPath))
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(tornPath))
   })
 })
 

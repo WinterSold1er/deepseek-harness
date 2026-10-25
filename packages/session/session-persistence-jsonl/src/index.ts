@@ -43,6 +43,7 @@ import {
 } from './format.ts'
 import {
   compressZstdFrame, createZstdFrameDecoder, decompressZstdFrame, decompressZstdPrefix, scanZstdFrames,
+  splitHeaderRecord,
 } from './zstd.ts'
 import { ensureDurableDirectoryWin32, publishNewFileWin32 } from './win32.ts'
 import { verifyCurrentGenerationInWorker } from './migration-verifier.ts'
@@ -74,12 +75,16 @@ const DEFAULT_COMPRESSION: JsonlCompression = 'zstd'
  */
 const ZSTD_DECODE_YIELD_INTERVAL_MS = 500
 
-/** Assert that the independently decodable first frame contains only the header record. */
-function assertZstdHeaderFrame(plaintext: Buffer): void {
-  if (plaintext.length === 0 || plaintext.indexOf(0x0A) !== plaintext.length - 1) {
-    throw new Error('corrupt Zstandard session log: first frame is not exactly one header line')
-  }
-}
+/**
+ * Internal protocol bounds, not deployment configuration: the header record is
+ * the first record of every Session log, so a listing reader stops looking for
+ * it after this much compressed input, this much decoded plaintext, or this
+ * wall-clock time instead of accumulating an arbitrarily large first record.
+ */
+const ZSTD_HEADER_READ_CHUNK_BYTES = 64 * 1024
+const ZSTD_HEADER_MAX_COMPRESSED_BYTES = 1024 * 1024
+const ZSTD_HEADER_MAX_PLAINTEXT_BYTES = 1024 * 1024
+const ZSTD_HEADER_READ_TIMEOUT_MS = 5000
 
 /** Loader schema for the JSONL artifact's physical encoding. */
 export const JsonlCompressionSchema: z<JsonlCompression> = z.union([
@@ -990,7 +995,11 @@ class JsonlSessionPersistence extends SessionPersistence {
     return this.acquireLease(header.id, header.cwd)
   }
 
-  /** Decode complete frames and retain complete JSONL records from a torn final frame. */
+  /**
+   * Decode complete frames and retain complete JSONL records from a torn final
+   * frame. The first decoded frame carries the header record as its first line;
+   * event records written into that same frame follow the terminator.
+   */
   private async readZstdPrefix(
     buffer: Buffer,
     signal?: AbortSignal,
@@ -1015,8 +1024,9 @@ class JsonlSessionPersistence extends SessionPersistence {
       signal?.throwIfAborted()
       /* v8 ignore next -- a non-empty structural frame list makes the decoder yield its first frame or throw. */
       if (headerFrame.done) throw new Error('empty or header-less Zstandard session log')
-      assertZstdHeaderFrame(headerFrame.value)
-      const scanner = new SessionLogScanner(headerFrame.value)
+      const { header, rest } = splitHeaderRecord(headerFrame.value)
+      const scanner = new SessionLogScanner(header)
+      if (rest.length > 0) scanner.write(rest)
 
       let remainingFrames = frames.length - 1
       for (const plaintext of decodedFrames) {
@@ -1135,6 +1145,14 @@ class JsonlSessionPersistence extends SessionPersistence {
     return hash.digest('hex')
   }
 
+  /**
+   * List the readable generations of this root. A generation whose header
+   * record cannot be read is dropped from the result and reported through the
+   * logger with its path and source version; its session id stays unknown
+   * because the header that stores it never decoded.
+   * @param signal - caller cancellation.
+   * @returns one entry per generation with a readable header record.
+   */
   private async listArtifacts(
     signal?: AbortSignal,
   ): Promise<Array<GenerationHeader & { path: string; sourceVersion: number }>> {
@@ -1148,6 +1166,12 @@ class JsonlSessionPersistence extends SessionPersistence {
         return { selected, metadata: await this.readGenerationHeader(selected, undefined, signal) }
       } catch (error: unknown) {
         if (error instanceof SessionFormatUnsupportedError || error instanceof SessionPersistenceCorruptionError) {
+          // The header record is unreadable, so the dropped artifact cannot be
+          // named by session id; report the path and version instead.
+          this.ctx.logger.warn(
+            `${this.name}: ignoring session log "${selected.sourcePath}" (source v${selected.sourceVersion}): `
+            + `${error.name}: ${error.message}`,
+          )
           return { selected, metadata: undefined }
         }
         throw error
@@ -1169,7 +1193,16 @@ class JsonlSessionPersistence extends SessionPersistence {
     return artifacts
   }
 
-  /** Read and translate one selected generation header without inspecting its body. */
+  /**
+   * Read and translate one selected generation header without inspecting its
+   * body. A generation without a decodable header record is reported through
+   * the logger and returns `undefined`; a corrupt header that the seam's error
+   * vocabulary classifies is thrown instead.
+   * @param selected - the generation selected from its directory.
+   * @param expectedId - session id the caller expects, when known.
+   * @param signal - caller cancellation.
+   * @returns the translated header, or `undefined` when the record is unreadable.
+   */
   private async readGenerationHeader(
     selected: ResolvedJsonlGeneration,
     expectedId?: SessionId,
@@ -1186,11 +1219,18 @@ class JsonlSessionPersistence extends SessionPersistence {
       throw error
     }
     signal?.throwIfAborted()
-    if (first === undefined) return undefined
+    if (first === undefined) {
+      this.ctx.logger.warn(`${this.name}: session log "${selected.sourcePath}" has no header record; ignoring the artifact`)
+      return undefined
+    }
     let value: unknown
     try {
       value = JSON.parse(first)
-    } catch {
+    } catch (error: unknown) {
+      this.ctx.logger.warn(
+        `${this.name}: session log "${selected.sourcePath}" header record is not valid JSON: `
+        + `${String(error)}; ignoring the artifact`,
+      )
       return undefined
     }
     assertNoRetiredHeaderFields(value)
@@ -1213,7 +1253,10 @@ class JsonlSessionPersistence extends SessionPersistence {
         { kind: 'jsonl', path: selected.sourcePath },
       )
     }
-    if (result.status === 'malformed') return undefined
+    if (result.status === 'malformed') {
+      this.ctx.logger.warn(`${this.name}: session log "${selected.sourcePath}" header record is malformed; ignoring the artifact`)
+      return undefined
+    }
     const header = this.currentHeader(result.header)
     await this.assertStoredIdentity(
       selected.sourcePath,
@@ -1495,30 +1538,53 @@ class JsonlSessionPersistence extends SessionPersistence {
     }
   }
 
-  /** Read only the header frame; compression failures reject as corruption, while I/O and cancellation propagate. */
+  /**
+   * Read the header record, which is the first record of the first Zstandard
+   * frame; event records written into that same frame follow it. An incomplete
+   * frame is decoded as far as it has arrived, so a large frame's trailing
+   * checksum is only verified by a later full read. Header reads stop at the
+   * protocol bounds and report corruption; I/O errors and cancellation
+   * propagate. An empty file has no header record.
+   * @param path - the generation file to read.
+   * @param signal - caller cancellation.
+   * @returns the header record without its newline, or `undefined` for an empty file.
+   */
   private async readFirstZstdLine(path: string, signal?: AbortSignal): Promise<string | undefined> {
     signal?.throwIfAborted()
+    const deadline = AbortSignal.timeout(ZSTD_HEADER_READ_TIMEOUT_MS)
     const handle = await open(path, 'r')
     try {
-      signal?.throwIfAborted()
       let content = Buffer.alloc(0)
-      const chunk = Buffer.alloc(8192)
+      const chunk = Buffer.alloc(ZSTD_HEADER_READ_CHUNK_BYTES)
       for (;;) {
         signal?.throwIfAborted()
+        /* v8 ignore next -- a 5 s wall-clock header read is a timing race no test reproduces deterministically. */
+        if (deadline.aborted) throw new SessionPersistenceCorruptionError(`corrupt Zstandard session log: header read exceeded ${ZSTD_HEADER_READ_TIMEOUT_MS} ms (raw log: ${path})`, { cause: new Error('header read deadline elapsed') })
         const { bytesRead } = await handle.read(chunk, 0, chunk.length, null)
         signal?.throwIfAborted()
-        if (bytesRead === 0) return undefined
-        signal?.throwIfAborted()
+        if (bytesRead === 0) {
+          if (content.length === 0) return undefined
+          throw new SessionPersistenceCorruptionError(
+            `corrupt Zstandard session log: header record not found (raw log: ${path})`,
+            { cause: new Error('end of file reached before the header record') },
+          )
+        }
         content = Buffer.concat([content, chunk.subarray(0, bytesRead)])
-        signal?.throwIfAborted()
+        if (content.length > ZSTD_HEADER_MAX_COMPRESSED_BYTES) {
+          throw new SessionPersistenceCorruptionError(
+            `corrupt Zstandard session log: header record not found within ${ZSTD_HEADER_MAX_COMPRESSED_BYTES} compressed bytes (raw log: ${path})`,
+            { cause: new Error('compressed-byte bound elapsed while searching for the header record') },
+          )
+        }
+        // A structurally complete frame is decoded strictly so its checksum is
+        // validated; an incomplete one is decoded as far as it has arrived.
+        let plaintext: Buffer
         try {
-          const first = scanZstdFrames(content, 1).frames[0]
-          if (first === undefined) continue
-          const plaintext = await decompressZstdFrame(content.subarray(first.start, first.end))
-          signal?.throwIfAborted()
-          assertZstdHeaderFrame(plaintext)
-          return plaintext.subarray(0, -1).toString('utf8')
-        } catch (error) {
+          const frame = scanZstdFrames(content, 1).frames[0]
+          plaintext = frame === undefined
+            ? await decompressZstdPrefix(content)
+            : await decompressZstdFrame(content.subarray(frame.start, frame.end))
+        } catch (error: unknown) {
           /* v8 ignore next -- decoder failure plus concurrent abort is timing-dependent */
           if (signal?.aborted) signal.throwIfAborted()
           throw new SessionPersistenceCorruptionError(
@@ -1526,6 +1592,15 @@ class JsonlSessionPersistence extends SessionPersistence {
             { cause: error },
           )
         }
+        signal?.throwIfAborted()
+        if (plaintext.length > ZSTD_HEADER_MAX_PLAINTEXT_BYTES) {
+          throw new SessionPersistenceCorruptionError(
+            `corrupt Zstandard session log: first record exceeds ${ZSTD_HEADER_MAX_PLAINTEXT_BYTES} plaintext bytes (raw log: ${path})`,
+            { cause: new Error('plaintext-byte bound elapsed while searching for the header record') },
+          )
+        }
+        const newline = plaintext.indexOf(0x0A)
+        if (newline !== -1) return plaintext.subarray(0, newline).toString('utf8')
       }
     } finally {
       await handle.close()

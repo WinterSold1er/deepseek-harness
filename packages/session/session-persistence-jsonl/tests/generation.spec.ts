@@ -1011,7 +1011,7 @@ describe('JSONL immutable generation publication', () => {
     expect(await decodeZstdJsonl(tornRequest.currentPath)).toBe(line(header(SESSION_FORMAT_VERSION)) + line(event0) + line(event1))
   })
 
-  it('rejects header-less raw and Zstandard sources and a non-independent Zstandard header frame', async () => {
+  it('rejects header-less raw and Zstandard sources and reads a header record that shares its frame', async () => {
     const root = await tempRoot()
     const rawRoot = join(root, 'raw')
     const emptyZstdRoot = join(root, 'empty-zstd')
@@ -1030,9 +1030,20 @@ describe('JSONL immutable generation publication', () => {
     await expect(ensureJsonlGenerationCurrent(emptyZstd)).rejects.toThrow(
       'empty or header-less Zstandard session log',
     )
-    await expect(ensureJsonlGenerationCurrent(joinedZstd)).rejects.toThrow(
-      'first frame is not exactly one header line',
-    )
+    await ensureJsonlGenerationCurrent(joinedZstd)
+    expect(await decodeZstdJsonl(joinedZstd.currentPath)).toBe(line(header(SESSION_FORMAT_VERSION)) + line(event0))
+  })
+
+  it('verifies a current generation whose header record shares its frame with an event record', async () => {
+    const root = await tempRoot()
+    const path = generationPath(root, SESSION_FORMAT_VERSION, 'zstd')
+    await writeFile(path, await compressZstdFrame(
+      line({ ...header(SESSION_FORMAT_VERSION), isSeeded: false }) + line(event0),
+    ))
+
+    await expect(verifyJsonlCurrentGeneration(path, 'zstd', 'generation-test', 1)).resolves.toBeDefined()
+    await expect(verifyJsonlCurrentGeneration(path, 'zstd', 'generation-test', 2))
+      .rejects.toThrow('contains 1 events')
   })
 
   it('rejects a complete Zstandard frame whose final JSONL record is torn', async () => {
