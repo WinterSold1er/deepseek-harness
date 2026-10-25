@@ -70,6 +70,10 @@ async function harness(options: HarnessOptions = {}) {
 
   const changes: DomainChanged[] = []
   ctx.on('domain/changed', (change) => { changes.push(change) })
+  const warnings: string[] = []
+  vi.spyOn(ctx.logger, 'warn').mockImplementation((...args: unknown[]) => {
+    warnings.push(args.map(String).join(' '))
+  })
   const fiber = await ctx.plugin(WorkspaceRegistry)
   const initChanges = [...changes]
   changes.length = 0
@@ -80,6 +84,7 @@ async function harness(options: HarnessOptions = {}) {
     registry: ctx.workspaceRegistry,
     changes,
     initChanges,
+    warnings,
     list,
     open,
     stat,
@@ -204,6 +209,8 @@ describe('WorkspaceRegistry lifecycle and bootstrap', () => {
     ctx.provide('sessionPersistence', { list } as never)
     await fiber.await()
     expect(ctx.workspaceRegistry.list()).toEqual([])
+    // Startup takes one stored-header listing and reuses it for the header
+    // index, bootstrap, and the startup reconciliation pass.
     expect(list).toHaveBeenCalledTimes(1)
     expect(storedState(pool)).toEqual({ initialized: true, workspaceIds: [], archivedSessionIds: [], pinnedSessionIds: [] })
   })
@@ -266,7 +273,10 @@ describe('WorkspaceRegistry lifecycle and bootstrap', () => {
     await first.fiber.dispose()
 
     const second = await harness({ pool, sessions: [header('late', late, 100)] })
-    expect(second.list).not.toHaveBeenCalled()
+    // Startup always re-indexes and reconciles from its single listing, but with
+    // no workspace record to reconcile there is nothing to re-admit, and bootstrap
+    // never runs again.
+    expect(second.list).toHaveBeenCalledTimes(1)
     expect(second.registry.list()).toEqual([])
     expect(storedState(pool)).toEqual({ initialized: true, workspaceIds: [], archivedSessionIds: [], pinnedSessionIds: [] })
   })
@@ -726,6 +736,8 @@ describe('Workspace session ordering', () => {
     const workspace = await result.registry.create(dir)
     await workspace.attachSession(SessionId('live'))
     expect(workspace.sessionIds).toEqual(['live'])
+    // Startup lists once (header index, bootstrap, and reconciliation from the
+    // same listing); validating the live session adds no persistence read.
     expect(result.list).toHaveBeenCalledTimes(1)
   })
 
@@ -832,7 +844,7 @@ describe('header-validated membership projection', () => {
     expect(result.registry.get(id)!.sessionIds).toEqual(['kept'])
   })
 
-  it.each(['EACCES', 'ELOOP', 'ENOTDIR'])('does not preserve candidates after a %s path failure', async (code) => {
+  it.each(['EACCES', 'ELOOP', 'ENOTDIR'])('prunes candidates after a %s path failure and warns once', async (code) => {
     const dir = await makeDir(`path-error-${code}`)
     const id = WorkspaceId(`path-error-${code}`)
     const pool = storedPool([[id, record(dir, ['invalid'])]], { initialized: true, workspaceIds: [id] })
@@ -842,7 +854,12 @@ describe('header-validated membership projection', () => {
     onTestFinished(() => result.ctx.fiber.dispose())
     const workspace = result.registry.get(id)!
     expect(workspace.sessionIds).toEqual([])
-    await workspace.setTitle('Pruned')
+    expect(storedRecord(pool, id).sessionIds).toEqual([])
+    expect(result.warnings.filter(warning => warning.includes('pruned session'))).toEqual([
+      `workspace pruned session 'invalid' from membership at '${dir}': `
+      + `cwd '${dir}' does not resolve: Error: ${code}`,
+    ])
+    await workspace.setTitle('Settled')
     expect(storedRecord(pool, id).sessionIds).toEqual([])
   })
 
@@ -865,11 +882,16 @@ describe('header-validated membership projection', () => {
     result.setSessions([header('kept'), header('trigger-three', elsewhere)])
     await result.registry.pinSession(SessionId('trigger-three'))
     expect(workspace.sessionIds).toEqual([])
-    await workspace.setTitle('Pruned')
+    await workspace.setTitle('Settled')
+    // The re-indexed header has no cwd at all, which is confirmed staleness, so
+    // the write prunes the id instead of keeping the missing-path exemption.
     expect(storedRecord(pool, id).sessionIds).toEqual([])
+    expect(result.warnings.filter(warning => warning.includes("pruned session 'kept'"))).toEqual([
+      `workspace pruned session 'kept' from membership at '${dir}': header has no cwd`,
+    ])
   })
 
-  it('filters absent headers and invalid cwd facts while retaining only missing-directory candidates', async () => {
+  it('retains missing-directory and uncovered ids durably while pruning every confirmed-invalid one', async () => {
     const dir = await makeDir('candidate-validation')
     const elsewhere = await makeDir('candidate-elsewhere')
     const missing = join(base, 'candidate-missing')
@@ -890,8 +912,25 @@ describe('header-validated membership projection', () => {
     onTestFinished(() => result.ctx.fiber.dispose())
     const workspace = result.registry.get(id)!
     expect(workspace.sessionIds).toEqual(['missing-dir'])
+    expect(storedRecord(pool, id).sessionIds).toEqual(['missing-dir', 'no-header'])
+    expect(result.warnings.filter(warning => warning.includes('pruned session'))).toEqual([
+      `workspace pruned session 'no-cwd' from membership at '${dir}': header has no cwd`,
+      `workspace pruned session 'relative' from membership at '${dir}': `
+      + 'cwd \'relative-missing\' is not a fully qualified path',
+      `workspace pruned session 'file' from membership at '${dir}': cwd '${file}' is not a directory`,
+      `workspace pruned session 'elsewhere' from membership at '${dir}': canonical cwd resolves to '${elsewhere}'`,
+    ])
+    // 'no-header' is covered by no index pass and its artifact check failed, so
+    // it is hidden yet retained, and reported once.
+    expect(result.warnings.filter(warning => warning.includes('outside the header index'))).toEqual([
+      expect.stringContaining("'no-header'"),
+    ])
+
+    const prunedBefore = result.warnings.filter(warning => warning.includes('pruned session')).length
     await workspace.setTitle('Validated')
-    expect(storedRecord(pool, id).sessionIds).toEqual(['missing-dir'])
+    expect(result.warnings.filter(warning => warning.includes('pruned session')).length).toBe(prunedBefore)
+    expect(storedRecord(pool, id).sessionIds).toEqual(['missing-dir', 'no-header'])
+    expect(workspace.sessionIds).toEqual(['missing-dir'])
   })
 
   it('can detach and reattach a missing-directory candidate after the directory is restored', async () => {
@@ -910,7 +949,7 @@ describe('header-validated membership projection', () => {
     expect(await workspace.status()).toBe('ok')
   })
 
-  it('requires both candidate id and matching canonical cwd without re-reading on list()', async () => {
+  it('admits a matching stored session, prunes a mismatch, and retains an uncovered id at startup', async () => {
     const owned = await makeDir('owned')
     const elsewhere = await makeDir('projection-elsewhere')
     const id = WorkspaceId('00000000-0000-4000-8000-000000000001')
@@ -927,14 +966,20 @@ describe('header-validated membership projection', () => {
       ],
     })
     const workspace = result.registry.list()[0]!
-    expect(workspace.sessionIds).toEqual(['good'])
-    expect(result.registry.list()[0]!.sessionIds).toEqual(['good'])
+    expect(workspace.sessionIds).toEqual(['cwd-only', 'good'])
+    expect(result.registry.list()[0]!.sessionIds).toEqual(['cwd-only', 'good'])
+    expect(storedRecord(pool, id).sessionIds).toEqual(['cwd-only', 'good', 'missing'])
+    expect(result.warnings.filter(warning => warning.includes('pruned session'))).toEqual([
+      `workspace pruned session 'mismatch' from membership at '${owned}': canonical cwd resolves to '${elsewhere}'`,
+    ])
+    // The projection itself reads nothing, and startup lists once for its header
+    // index, bootstrap, and reconciliation pass.
     expect(result.list).toHaveBeenCalledTimes(1)
-    expect(storedRecord(pool, id).sessionIds).toEqual(['good', 'mismatch', 'missing'])
 
-    await workspace.setTitle('pruned')
-    expect(storedRecord(pool, id).sessionIds).toEqual(['good'])
-    expect(workspace.sessionIds).not.toContain('cwd-only')
+    await workspace.setTitle('settled')
+    expect(storedRecord(pool, id).sessionIds).toEqual(['cwd-only', 'good', 'missing'])
+    expect(workspace.sessionIds).not.toContain('missing')
+    expect(workspace.sessionIds).toContain('cwd-only')
   })
 
   it('rejects duplicate candidate ownership, duplicate paths, and initialized order drift', async () => {

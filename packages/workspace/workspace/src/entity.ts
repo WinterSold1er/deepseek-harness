@@ -2,7 +2,7 @@
  * Package-private workspace entity: the single {@link Workspace}
  * implementation. Holds a record snapshot that is swapped in place after each
  * durable mutation; every write funnels through the private `mutate` so
- * `updatedAt` stamping and invalid-account pruning happen exactly once.
+ * `updatedAt` stamping and confirmed-stale pruning happen exactly once.
  * Not re-exported from the package entrypoint — consumers see only the
  * `Workspace` interface.
  * @module @deepseek-ai/dsh-workspace/src/entity
@@ -27,6 +27,22 @@ export class WorkspaceMoveInvalidError extends Error {
 }
 
 /**
+ * How the header index classifies one recorded session against a workspace
+ * path. `valid` has a readable header whose fully qualified cwd resolves to an
+ * existing directory equal to the path. `missing-dir` has a readable header
+ * whose fully qualified cwd fails to resolve with `ENOENT` only, so the
+ * directory may have been moved temporarily. `invalid` is confirmed staleness
+ * carried by the header itself: no cwd, a non-absolute cwd, a resolve failure
+ * for any other reason, a canonical cwd that is not a directory, or a canonical
+ * cwd at a different directory — the only state an accepted mutation prunes.
+ * `unknown` means no index pass covers the id: an unreadable header (including
+ * an absent one), a permission, timeout, or corruption failure, or a listing
+ * that never included the id. Only `invalid` is prunable; `valid` and
+ * `missing-dir` stay visible; `unknown` stays durable and hidden.
+ */
+export type CandidateState = 'valid' | 'missing-dir' | 'invalid' | 'unknown'
+
+/**
  * The registry-owned machinery an entity mutates through. Entities never see
  * the registry itself — only the open table, the canonical session-path
  * index backing the `sessionIds` projection, and attach-time header reads.
@@ -39,13 +55,14 @@ export interface WorkspaceEntityHost {
   table(): KvTable<WorkspaceId, WorkspaceRecord>
 
   /**
-   * Validate an already-accounted session, preserving ownership when its fully
-   * qualified cwd cannot resolve because a path component is missing.
+   * Classify an already-accounted session against a workspace path. A missing
+   * directory cannot confirm a mismatch, and an id the index does not cover
+   * stays `unknown` rather than becoming staleness evidence.
    * @param id - Session already present in this workspace's candidate account.
    * @param path - Workspace's stored canonical directory.
-   * @returns whether the candidate remains a member.
+   * @returns the index's classification of the candidate.
    */
-  candidateMatches(id: SessionId, path: string): boolean
+  candidateState(id: SessionId, path: string): CandidateState
 
   /**
    * Read one stored session header for attach validation.
@@ -61,10 +78,34 @@ export interface WorkspaceEntityHost {
    * @param path - Canonical existing directory from the immutable header cwd.
    */
   rememberSessionPath(id: SessionId, path: string): void
+
+  /**
+   * Report one durable prune of a confirmed-stale (`invalid`) session id.
+   * id. Called exactly once per pruned id, before the membership write lands, so
+   * an operator can see every removal the registry makes on its own.
+   * @param id - The pruned session id.
+   * @param path - The workspace path whose membership no longer holds the id.
+   */
+  reportPruned(id: SessionId, path: string): void
 }
 
 /** Chain-slot abort sentinel thrown by the update fn when the record needs no change; only `mutate` observes it. */
 const unchangedSentinel = new Error('workspace record unchanged (internal sentinel)')
+
+/**
+ * Copy `record` with its detach tombstone set to `detachedSessionIds`. The
+ * field is omitted when that list is empty, so a record that never detached a
+ * session keeps the fields it was written with.
+ * @param record - Record to copy.
+ * @param detachedSessionIds - Tombstone entries to store, in detach order.
+ * @returns the copied record.
+ */
+function withDetachedSessionIds(record: WorkspaceRecord, detachedSessionIds: readonly SessionId[]): WorkspaceRecord {
+  const next: WorkspaceRecord = { ...record }
+  if (detachedSessionIds.length === 0) delete next.detachedSessionIds
+  else next.detachedSessionIds = detachedSessionIds
+  return next
+}
 
 /** The single {@link Workspace} implementation; constructed only by the registry. */
 export class WorkspaceEntity implements Workspace {
@@ -100,7 +141,10 @@ export class WorkspaceEntity implements Workspace {
   }
 
   get sessionIds(): readonly SessionId[] {
-    return this.record.sessionIds.filter(id => this.host.candidateMatches(id, this.record.path))
+    return this.record.sessionIds.filter((id) => {
+      const state = this.host.candidateState(id, this.record.path)
+      return state === 'valid' || state === 'missing-dir'
+    })
   }
 
   async setTitle(title: string): Promise<void> {
@@ -144,9 +188,36 @@ export class WorkspaceEntity implements Workspace {
       }
       this.host.rememberSessionPath(sessionId, cwd)
     }
-    await this.mutate(record => record.sessionIds.includes(sessionId)
-      ? record
-      : { ...record, sessionIds: [sessionId, ...record.sessionIds] })
+    await this.mutate((record) => {
+      if (record.sessionIds.includes(sessionId) && !record.detachedSessionIds?.includes(sessionId)) return record
+      return withDetachedSessionIds(
+        record.sessionIds.includes(sessionId)
+          ? record
+          : { ...record, sessionIds: [sessionId, ...record.sessionIds] },
+        (record.detachedSessionIds ?? []).filter(id => id !== sessionId),
+      )
+    })
+  }
+
+  /**
+   * Admit stored sessions the header index confirms at this workspace's
+   * canonical path, prepending them in the given order through one durable
+   * mutation, and drop every admitted id from the detach tombstone.
+   * @param sessionIds - Stored session ids, newest first, whose canonical cwd is this path.
+   * @returns the ids actually added; empty when every id was already accounted.
+   */
+  async admitSessions(sessionIds: readonly SessionId[]): Promise<readonly SessionId[]> {
+    let added: readonly SessionId[] = []
+    await this.mutate((record) => {
+      const missing = sessionIds.filter(id => !record.sessionIds.includes(id))
+      if (missing.length === 0) return record
+      added = missing
+      return withDetachedSessionIds(
+        { ...record, sessionIds: [...missing, ...record.sessionIds] },
+        (record.detachedSessionIds ?? []).filter(id => !missing.includes(id)),
+      )
+    })
+    return added
   }
 
   async insertSessionBefore(sessionId: SessionId, beforeSessionId?: SessionId): Promise<void> {
@@ -172,10 +243,21 @@ export class WorkspaceEntity implements Workspace {
     })
   }
 
+  /**
+   * Remove `sessionId` from the account and append it to the detach tombstone
+   * in the same mutation, so the removal survives a restart. Detaching an id
+   * the account does not hold writes nothing, whether or not the tombstone
+   * already holds it.
+   */
   async detachSession(sessionId: SessionId): Promise<void> {
-    await this.mutate(record => record.sessionIds.includes(sessionId)
-      ? { ...record, sessionIds: record.sessionIds.filter(id => id !== sessionId) }
-      : record)
+    await this.mutate((record) => {
+      if (!record.sessionIds.includes(sessionId)) return record
+      const tombstone = record.detachedSessionIds ?? []
+      return withDetachedSessionIds(
+        { ...record, sessionIds: record.sessionIds.filter(id => id !== sessionId) },
+        tombstone.includes(sessionId) ? tombstone : [...tombstone, sessionId],
+      )
+    })
   }
 
   async status(): Promise<'ok' | 'missing-dir'> {
@@ -190,24 +272,33 @@ export class WorkspaceEntity implements Workspace {
 
   /**
    * The single write path: run `fn` on the domain write chain via
-   * `table.update`, stamping `updatedAt` and pruning candidates that no
-   * longer pass the candidate membership check, then swap the
-   * snapshot.
+   * `table.update`, stamping `updatedAt` and pruning only candidates the
+   * header index confirms `invalid`, then swap the snapshot.
+   * `unknown` and `missing-dir` candidates are retained verbatim: an id the
+   * index does not cover is never treated as stale, and recovery of an
+   * unreachable cwd is `WorkspaceRegistry.reconcile`.
    *
    * `fn` sees the value current at its chain slot, so membership decisions
    * (attach/detach idempotence) are race-free against queued writes; a fn
    * signalling no change by returning `current` verbatim aborts the slot
    * through the sentinel when pruning also finds nothing, so a no-op neither
    * rewrites the medium nor emits a change event.
+   *
+   * Every prune is observable: each confirmed-stale id is reported through
+   * {@link WorkspaceEntityHost.reportPruned} before the write lands, so no
+   * durable membership removal happens silently.
    */
   private async mutate(fn: (record: WorkspaceRecord) => WorkspaceRecord): Promise<void> {
     let next: WorkspaceRecord
     try {
       next = await this.host.table().update(this.id, (current) => {
         const changed = fn(current)
-        const sessionIds = changed.sessionIds.filter(
-          id => this.host.candidateMatches(id, changed.path),
-        )
+        const sessionIds = changed.sessionIds.filter((id) => {
+          const state = this.host.candidateState(id, changed.path)
+          if (state !== 'invalid') return true
+          this.host.reportPruned(id, changed.path)
+          return false
+        })
         if (changed === current && sessionIds.length === current.sessionIds.length) {
           throw unchangedSentinel
         }

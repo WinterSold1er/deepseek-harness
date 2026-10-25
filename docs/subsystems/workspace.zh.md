@@ -54,12 +54,17 @@ interface Workspace {
    * Header-validated sessions in manually owned order: a new session is
    * prepended at attach, explicit reordering goes through
    * `insertSessionBefore`, and activity never reorders. The durable candidate
-   * account is filtered synchronously: missing headers, invalid cwd values,
-   * and canonical cwd mismatches are never returned. A fully qualified cwd
-   * whose realpath or directory stat fails with ENOENT preserves an existing
-   * candidate, including a dangling symlink; other filesystem failures do not.
-   * A subsequent mutation prunes filtered candidates, not missing-directory
-   * candidates. This does not admit new sessions or recreate directories.
+   * account is filtered synchronously: a candidate is visible only when it is
+   * valid (a readable header whose fully qualified cwd resolves to an existing
+   * directory equal to this path) or missing-directory (that resolve fails with
+   * ENOENT only, so the directory may just have moved, including a dangling
+   * symlink). Invalid candidates (no cwd, a non-absolute cwd, a resolve failure
+   * for any other reason, a canonical cwd that is not a directory, or a
+   * canonical cwd at a different directory) are never returned. Startup
+   * reconciliation and every later mutation prune invalid candidates, never
+   * missing-directory ones; an unknown
+   * candidate no index pass covers stays hidden and retained until a pass covers
+   * it. This does not admit new sessions or recreate directories.
    */
   readonly sessionIds: readonly SessionId[]
 
@@ -73,7 +78,7 @@ interface Workspace {
   /**
    * Prepend a session to this workspace's candidate account. An already
    * accounted id resolves without writing, aside from the durable
-   * filtered-candidate prune every accepted mutation performs. A new id's
+   * invalid-candidate prune every accepted mutation performs. A new id's
    * live or persisted
    * header cwd must resolve to an existing directory equal to {@link path};
    * unknown ids, missing or invalid cwd values, and mismatches reject without
@@ -88,9 +93,8 @@ interface Workspace {
    * with an anchor the session lands before it, without one it appends to the
    * end. Only the moved id changes position. A session or anchor absent from
    * the account rejects without writing; a move to the current position
-   * resolves without writing, aside from the durable filtered-candidate
-   * prune every accepted mutation performs; decided on the domain write
-   * chain.
+   * resolves without writing, aside from the durable invalid-candidate prune
+   * every accepted mutation performs; decided on the domain write chain.
    * @param sessionId - The accounted session to move.
    * @param beforeSessionId - Accounted anchor to insert before; omitted appends.
    * @returns resolution after durability.
@@ -98,10 +102,15 @@ interface Workspace {
   insertSessionBefore(sessionId: SessionId, beforeSessionId?: SessionId): Promise<void>
 
   /**
-   * Remove a session from this workspace's account. Idempotent: an id not on
-   * the account resolves without writing, aside from the durable
-   * filtered-candidate prune every accepted mutation performs; decided on
-   * the domain write chain like attach. Never touches the session's own stored log.
+   * Remove a session from this workspace's account. This is the only removal
+   * from membership that a restart cannot undo: the id is recorded as detached
+   * in the same mutation, so startup reconciliation and every later reconcile
+   * pass skip it, and a later attachSession clears that record. Idempotent: an
+   * id not on the account resolves without writing, whether or not it is
+   * already recorded as detached, aside from the durable invalid-candidate
+   * prune every accepted mutation performs; decided on the domain write chain
+   * like attach. Never touches the session's own stored log, and an invalid
+   * prune is not a detach: a pruned id a later pass covers is admitted again.
    * @param sessionId - The session to remove.
    * @returns resolution after durability.
    */
@@ -117,7 +126,7 @@ interface Workspace {
 }
 ```
 
-所有权的真源是记录中有序的 `sessionIds`，绝不从会话 cwd 派生。成员资格将记录的 header cwd 与工作区路径校验；已有候选的完全限定 cwd 在路径解析或目录 stat 时返回 `ENOENT`，仍保留其归属。这会保留目录缺失或符号链接失效时的记账关系，但不会接纳新会话。失败的写入会拒绝（`insertSessionBefore` 的账本错误以 `WorkspaceMoveInvalidError` 拒绝，存储失败以普通错误拒绝）；每次被接受的变更都盖上 `updatedAt` 时间戳，并持久修剪不再通过成员资格检查的候选项。
+所有权的真源是记录中有序的 `sessionIds`，绝不从会话 cwd 派生。成员资格将记录的 header cwd 与工作区路径校验；已有候选的完全限定 cwd 在路径解析或目录 stat 时返回 `ENOENT`，仍保留其归属。这会保留目录缺失或符号链接失效时的记账关系，但不会接纳新会话。失败的写入会拒绝（`insertSessionBefore` 的账本错误以 `WorkspaceMoveInvalidError` 拒绝，存储失败以普通错误拒绝）；每次被接受的变更都盖上 `updatedAt` 时间戳，并持久修剪索引确认为无效的候选项，绝不修剪目录缺失或未知的候选项。
 
 ## 注册表：`ctx.workspaceRegistry`
 

@@ -17,14 +17,18 @@ const workspaceId = z.string().transform(value => value as WorkspaceId)
 const sessionId = z.string().transform(value => brandString<SessionId>(value))
 
 /**
- * Durable shape of one workspace record. `path` is the `fs.realpath` canon
+ * Durable fields of one workspace record. `path` is the `fs.realpath` canon
  * stamped at create; `sessionIds` is the ordered ownership account (array
- * order is display order); timestamps are ISO-8601 strings.
+ * order is display order); `detachedSessionIds` is the tombstone of every
+ * explicit `detachSession`, kept so startup reconciliation does not re-admit
+ * that session, omitted when it would be empty, and never a membership list;
+ * timestamps are ISO-8601 strings.
  */
 export const workspaceRecord = z.object({
   path: z.string(),
   title: z.string(),
   sessionIds: z.array(sessionId),
+  detachedSessionIds: z.array(sessionId).readonly().optional(),
   createdAt: z.string(),
   updatedAt: z.string(),
 })

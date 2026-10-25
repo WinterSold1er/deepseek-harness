@@ -39,6 +39,14 @@ export function WorkspaceId(id: string): WorkspaceId {
   return id as WorkspaceId
 }
 
+/** What one {@link WorkspaceRegistry.reconcile} pass committed. */
+export interface ReconcileResult {
+  /** Session ids admitted into workspace accounts, newest first within each workspace. */
+  readonly added: readonly SessionId[]
+  /** Session ids pruned as confirmed invalid, in their recorded order within each workspace. */
+  readonly pruned: readonly SessionId[]
+}
+
 /**
  * An archiveSession or pinSession request named a session neither live nor in
  * session persistence — a definite miss only; storage faults propagate as
@@ -160,12 +168,16 @@ const sameIds = (left: readonly WorkspaceId[], right: readonly WorkspaceId[]): b
 const compareHeaders = (left: SessionHeader, right: SessionHeader): number =>
   right.createdAt - left.createdAt || String(left.id).localeCompare(String(right.id))
 
+/** Whether a thrown failure carries the `ENOENT` code for an absent file. */
+const isENOENT = (error: unknown): boolean =>
+  error instanceof Error && 'code' in error && error.code === 'ENOENT'
+
 /**
  * Durable workspace registry. Startup waits for `sessionPersistence`, builds
- * one canonical-cwd header index, and completes the one-time history
- * bootstrap before the service becomes active. The persistence dependency is
- * mandatory so an unavailable peer can never be mistaken for an empty
- * history and commit the initialized marker.
+ * one canonical-cwd header index, completes the one-time history bootstrap, and
+ * reconciles every workspace's membership against that index before the service
+ * becomes active. The persistence dependency is mandatory so an unavailable peer
+ * can never be mistaken for an empty history and commit the initialized marker.
  */
 export class WorkspaceRegistry extends Service {
   static inject = ['storageDomain', 'sessionPersistence']
@@ -177,17 +189,28 @@ export class WorkspaceRegistry extends Service {
   private readonly headers = new Map<SessionId, SessionHeader>()
   private readonly sessionPaths = new Map<SessionId, string>()
   private readonly missingSessionPaths = new Set<SessionId>()
+  /** Why the index confirms a recorded id stale: a bad cwd, or the directory a valid cwd resolves to. */
   private readonly invalidSessionPaths = new Map<SessionId, string>()
   private operationTail: Promise<void> = Promise.resolve()
 
   private readonly host: WorkspaceEntityHost = {
     table: () => this.requireTable(),
-    candidateMatches: (id, path) => this.sessionPaths.get(id) === path || this.missingSessionPaths.has(id),
+    candidateState: (id, path) => {
+      const indexed = this.sessionPaths.get(id)
+      if (indexed !== undefined) return indexed === path ? 'valid' : 'invalid'
+      if (this.missingSessionPaths.has(id)) return 'missing-dir'
+      return this.invalidSessionPaths.has(id) ? 'invalid' : 'unknown'
+    },
     readSessionHeader: id => this.readSessionHeader(id),
     rememberSessionPath: (id, path) => {
       this.sessionPaths.set(id, path)
       this.missingSessionPaths.delete(id)
-      this.invalidSessionPaths.delete(id)
+      this.invalidSessionPaths.set(id, `canonical cwd resolves to '${path}'`)
+    },
+    reportPruned: (id, path) => {
+      this.ctx.logger.warn(
+        `workspace pruned session '${id}' from membership at '${path}': ${this.invalidReason(id)}`,
+      )
     },
   }
 
@@ -195,7 +218,7 @@ export class WorkspaceRegistry extends Service {
     super(ctx, 'workspaceRegistry')
   }
 
-  /** Open the domain, finish bootstrap when required, and rebuild the ordered cache. */
+  /** Open the domain, finish bootstrap when required, and reconcile membership from the one stored-header listing this boot takes. */
   protected async [Service.init](): Promise<void> {
     const domain = await this.ctx.storageDomain.open(workspaceDomainSpec)
     this.ctx.effect(() => () => domain.close(), 'workspace.domainClose')
@@ -205,17 +228,13 @@ export class WorkspaceRegistry extends Service {
 
     await this.recoverPendingMutation()
     this.validateStoredState(this.state)
-    if (!this.state.initialized) {
-      const headers = await this.listStoredHeaders()
-      await this.replaceHeaderIndex(headers)
-      await this.bootstrap(headers)
-    } else if (this.table.size > 0) {
-      await this.replaceHeaderIndex(await this.listStoredHeaders())
-    }
+    const headers = await this.listStoredHeaders()
+    await this.replaceHeaderIndex(headers)
+    if (!this.state.initialized) await this.bootstrap(headers)
 
-    await this.indexLiveSessions()
     this.validateStoredState(this.requireState())
     this.rebuildEntities()
+    await this.reconcileFromHeaders(headers)
     this.reportFilteredCandidates()
   }
 
@@ -505,6 +524,66 @@ export class WorkspaceRegistry extends Service {
       if (entity.path === canonical) return entity
     }
     return undefined
+  }
+
+  /**
+   * Rebuild the session-path index from one fresh persistence listing plus live
+   * sessions, then commit one mutation per target workspace: newly admitted ids
+   * are prepended newest first, and only ids the index confirms `invalid` are
+   * pruned. An id no header pass covers stays `unknown` and retained.
+   * Idempotent: a workspace that needs neither admission nor pruning writes
+   * nothing and emits no change event. Subagent sessions (header.origin ===
+   * 'subagent') are never admitted. Every prune is durable and logged at warn
+   * with the id, the workspace path, and the recorded reason. A member an
+   * earlier pass pruned comes back through re-admission, which runs at startup
+   * and on every call to this method. An id an explicit `detachSession`
+   * recorded as detached in that workspace's record is never admitted here;
+   * only `attachSession` clears that record.
+   * @param workspaceId - Workspace to reconcile; every open workspace when omitted.
+   * @returns the ids admitted and the ids pruned, in that order per workspace.
+   */
+  async reconcile(workspaceId?: WorkspaceId): Promise<ReconcileResult> {
+    return this.enqueueOperation(async () =>
+      this.reconcileFromHeaders(await this.listStoredHeaders(), workspaceId))
+  }
+
+  /**
+   * The reconcile pass over headers the caller already listed, so one boot lists
+   * once. Runs outside the operation chain; callers hold its ordering.
+   * @param headers - Stored headers from the single listing this pass uses.
+   * @param workspaceId - Workspace to reconcile; every open workspace when omitted.
+   * @returns the ids admitted and the ids pruned, in that order per workspace.
+   */
+  private async reconcileFromHeaders(
+    headers: readonly SessionHeader[],
+    workspaceId?: WorkspaceId,
+  ): Promise<ReconcileResult> {
+    await this.replaceHeaderIndex(headers)
+    await this.indexLiveSessions()
+    let targets: WorkspaceEntity[]
+    if (workspaceId === undefined) {
+      targets = [...this.entities.values()]
+    } else {
+      const entity = this.entities.get(workspaceId)
+      if (entity === undefined) throw new Error(`cannot reconcile unknown workspace '${workspaceId}'`)
+      targets = [entity]
+    }
+    const added: SessionId[] = []
+    const pruned: SessionId[] = []
+    for (const entity of targets) {
+      const record = this.requireTable().get(entity.id) as WorkspaceRecord
+      const candidates = [...this.headers.values()]
+        .filter(header => header.origin !== 'subagent'
+          && this.sessionPaths.get(header.id) === record.path
+          && !record.sessionIds.includes(header.id)
+          && !record.detachedSessionIds?.includes(header.id))
+        .sort(compareHeaders)
+        .map(header => header.id)
+      added.push(...await entity.admitSessions(candidates))
+      const settled = (this.requireTable().get(entity.id) as WorkspaceRecord).sessionIds
+      pruned.push(...record.sessionIds.filter(id => !settled.includes(id)))
+    }
+    return { added, pruned }
   }
 
   private async createCanonical(canonical: string, title?: string, firstUse = false): Promise<WorkspaceEntity> {
@@ -812,20 +891,27 @@ export class WorkspaceRegistry extends Service {
       this.invalidSessionPaths.set(header.id, 'header has no cwd')
       return
     }
+    if (!fullyQualifiedWorkspacePath(header.cwd)) {
+      this.invalidSessionPaths.set(header.id, `cwd '${header.cwd}' is not a fully qualified path`)
+      return
+    }
     try {
       const path = await realpathNormalize(header.cwd)
       if (!(await stat(path)).isDirectory()) {
+        // A regular file at the recorded cwd can never be a workspace
+        // directory, so this is confirmed staleness rather than an unknown.
         this.invalidSessionPaths.set(header.id, `cwd '${header.cwd}' is not a directory`)
         return
       }
       this.sessionPaths.set(header.id, path)
-      this.invalidSessionPaths.delete(header.id)
+      this.invalidSessionPaths.set(header.id, `canonical cwd resolves to '${path}'`)
     } catch (error) {
-      if (fullyQualifiedWorkspacePath(header.cwd)
-        && error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+      if (isENOENT(error)) {
         this.missingSessionPaths.add(header.id)
+        this.invalidSessionPaths.delete(header.id)
+        return
       }
-      this.invalidSessionPaths.set(header.id, `cwd '${header.cwd}' does not resolve`)
+      this.invalidSessionPaths.set(header.id, `cwd '${header.cwd}' does not resolve: ${String(error)}`)
     }
   }
 
@@ -841,21 +927,31 @@ export class WorkspaceRegistry extends Service {
     await this.indexHeaders(sessions.list().map(session => session.header))
   }
 
+  /** Warn once per recorded id no header index pass covers; `invalid` ids were already pruned with their own warn. */
   private reportFilteredCandidates(): void {
     for (const entity of this.entities.values()) {
       const record = this.requireTable().get(entity.id) as WorkspaceRecord
       for (const sessionId of record.sessionIds) {
-        if (this.host.candidateMatches(sessionId, record.path)) continue
-        const path = this.sessionPaths.get(sessionId)
-        const reason = this.invalidSessionPaths.get(sessionId)
-          ?? (this.headers.has(sessionId)
-            ? `canonical cwd '${path}' differs from workspace path '${record.path}'`
-            : 'session header is missing')
+        if (this.host.candidateState(sessionId, record.path) !== 'unknown') continue
         this.ctx.logger.warn(
-          `workspace '${entity.id}' filtered session '${sessionId}' from membership: ${reason}`,
+          `workspace '${entity.id}' at '${record.path}' holds session '${sessionId}' outside the header index: `
+          + 'session persistence lists no header for it, so it stays hidden until a later pass covers it',
         )
       }
     }
+  }
+
+  /**
+   * Reason one recorded id the index confirms `invalid`. `indexHeader` records
+   * one reason per id it indexes: the failed cwd, or the directory a valid cwd
+   * resolves to.
+   * @param id - Session id the index confirms `invalid`.
+   * @returns the reason to publish with the prune warning.
+   */
+  private invalidReason(id: SessionId): string {
+    const reason = this.invalidSessionPaths.get(id)
+    /* v8 ignore next -- every confirmed-stale id has a recorded reason. */
+    return reason ?? 'the header index confirms no usable cwd'
   }
 
   private async readSessionHeader(id: SessionId): Promise<SessionHeader> {

@@ -1,0 +1,22 @@
+# Bilingual-pair consistency record for 2026-10-25-workspace-session-membership-survives-index-gaps.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/bug-fix/2026-10-25-workspace-session-membership-survives-index-gaps.md
+/agent-note-workspace-membership-survives-session-index-gaps:
+  en: 8fce41aee88ab39e
+  zh: 8608330cab5773e5
+/agent-note-workspace-membership-survives-session-index-gaps/problem:
+  en: a344b8224f41c4e9
+  zh: 3f5f3a73db1d499e
+/agent-note-workspace-membership-survives-session-index-gaps/decision:
+  en: d3a0255439d9d124
+  zh: 220b301732573782
+/agent-note-workspace-membership-survives-session-index-gaps/alternatives-considered:
+  en: 961bc64d85bbe9fd
+  zh: 990dfb0346de6767
+/agent-note-workspace-membership-survives-session-index-gaps/consequences:
+  en: f4dfa2ac22447788
+  zh: 6755277a671443e6
+/agent-note-workspace-membership-survives-session-index-gaps/related-decisions:
+  en: d8bb7cdefe1aebe9
+  zh: fc7a67229eee4e6b
